@@ -11,30 +11,75 @@
 
 ## 1. Executive Summary & Core Architectural Premise
 
-When a Single Page Application runs inside a standard web browser, its origin is defined by the web server serving the HTML (e.g., `https://erp.campus.edu` or `http://localhost:5173`). In **Tauri v2 on Windows**, the user interface is rendered inside **Microsoft Edge WebView2**, which loads local embedded static assets (`frontend-v2/dist`) under a dedicated local scheme:
-- **Default Windows WebView2 Origin:** `https://tauri.localhost` (or `http://tauri.localhost` in legacy modes).
+When a Single Page Application runs inside a standard web browser, its origin is defined by the web server serving the HTML (e.g., `https://erp.campus.edu` or `http://localhost:5173`). In **Tauri v2 on Windows**, the user interface is rendered inside **Microsoft Edge WebView2**, which loads local embedded static assets (`frontend-v2/dist`) under a dedicated local scheme.
+
+### Official Tauri v2 Windows Origin Specification:
+- **Default Windows WebView2 Origin:** **`http://tauri.localhost`** (Default custom protocol scheme on Windows).
+- **Configured HTTPS Scheme:** Setting **`app.windows[].useHttpsScheme = true`** in `tauri.conf.json` elevates the local WebView origin to **`https://tauri.localhost`**.
 
 Because WebView2 enforces standard W3C browser security rules, any HTTP request initiated from JavaScript (via Axios or `window.fetch()`) to an external Spring Boot backend (e.g. `https://erp.campus.edu:8081`) constitutes a **cross-origin request**.
-
-This specification defines the complete CORS architecture ensuring seamless, secure communication for both the web application and the Windows desktop client.
 
 ```
 +----------------------------------------------------------------------------------------------------+
 |                                    CORS ARCHITECTURE AT A GLANCE                                   |
 +------------------------------------+---------------------------------------------------------------+
-| Desktop Client Origin              | `https://tauri.localhost`                                     |
+| Selected Production Desktop Origin | `https://tauri.localhost` (via app.windows.useHttpsScheme=true)|
+| Default Unconfigured Origin        | `http://tauri.localhost` (Default Tauri v2 Windows scheme)    |
 | Browser Web Client Origins         | `https://erp.campus.edu`, `http://localhost:5173` (Dev)       |
 | Preflight OPTIONS Interception     | Spring Security CorsFilter (Ordered FIRST before Auth)        |
 | Credentialed Security Model        | `Authorization: Bearer <JWT>` (Stateless; zero session cookies)|
 | Allowed Methods                    | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`             |
-| Production Origin Policy           | Explicit Whitelist (Zero unrestricted wildcards)             |
-| Native Rust HTTP Bypass            | Rust reqwest probes bypass CORS (No Origin header)           |
+| Production Origin Policy           | Explicit Single Whitelist (No dual-scheme or wildcard clutter)|
+| Native Rust HTTP Bypass            | Rust reqwest probes bypass CORS (No Origin header emitted)    |
 +------------------------------------+---------------------------------------------------------------+
 ```
 
 ---
 
-## 2. Browser / WebView2 Requests vs. Native Rust HTTP Requests
+## 2. Fundamental Distinction: Local WebView Origin vs. HTTPS Backend API Connection
+
+To avoid architectural confusion between local asset rendering and network transport, the distinction between the two layers must be explicitly understood:
+
+```mermaid
+graph TD
+    subgraph ClientHost ["Windows Desktop Workstation (Client Layer)"]
+        subgraph WVEngine ["Microsoft Edge WebView2 Runtime"]
+            LocalAssets["Bundled HTML/JS/CSS Assets"]
+            LocalOrigin["Local Origin: https://tauri.localhost\n(app.windows.useHttpsScheme = true)"]
+            ReactHeap["React 19 Application (Axios)"]
+            LocalAssets --- LocalOrigin
+            LocalOrigin --- ReactHeap
+        end
+    end
+
+    subgraph NetworkWire ["Encrypted Network Boundary (TLS 1.3 Transport)"]
+        HTTPSCall["HTTPS POST /api/v1/*\nRequest Header: Origin: https://tauri.localhost\nRequest Header: Authorization: Bearer <JWT>"]
+    end
+
+    subgraph ServerHost ["Institutional / Cloud Tier (Server Layer)"]
+        SpringBoot["Spring Boot 3.3.4 (Port 8081)"]
+        CorsFilter["Spring CorsFilter\n(Whitelists ONLY https://tauri.localhost)"]
+        SpringBoot --- CorsFilter
+    end
+
+    ReactHeap == "Axios HTTP Call" ==> HTTPSCall
+    HTTPSCall == "Strict TLS 1.3" ==> CorsFilter
+```
+
+### 1. The Local WebView Origin (`window.location.origin`):
+- Operates entirely **inside the local desktop process**.
+- By default in Tauri v2 on Windows, it is `http://tauri.localhost`.
+- When `app.windows.useHttpsScheme = true` is configured, it becomes `https://tauri.localhost`.
+- It dictates the value of the `Origin` header attached by WebView2 to outgoing `fetch()` and Axios requests.
+
+### 2. The HTTPS Backend API Connection:
+- The actual TCP/IP and TLS network connection between the client workstation and the Spring Boot server (`https://erp.campus.edu:8081` or `https://cloud.edupulse.org`).
+- **Invariance:** This connection is **always encrypted over TLS/HTTPS**, with strict certificate chain verification against the Windows Root Certificate Store.
+- **Independence:** The local WebView scheme does **not** alter, weaken, or downgrade backend network security. The backend API connection remains strictly HTTPS regardless of whether the local webview is running on `http://` or `https://`.
+
+---
+
+## 3. Browser / WebView2 Requests vs. Native Rust HTTP Requests
 
 An essential architectural distinction exists between requests originating from the presentation layer versus the native runtime:
 
@@ -77,7 +122,7 @@ graph TD
 
 ---
 
-## 3. Preflight OPTIONS Request Lifecycle
+## 4. Preflight OPTIONS Request Lifecycle
 
 When the React desktop frontend executes a mutating call (such as student registration or grade submission):
 
@@ -112,37 +157,54 @@ sequenceDiagram
 
 ---
 
-## 4. Hardening Production CORS: Eliminating Wildcard Patterns
+## 5. Hardening Production CORS: Explicit Single-Origin Policy
 
-### 4.1 Vulnerability of the Current Implementation
-As audited in WP05A, `backend/src/main/java/com/erp/config/CorsConfig.java` currently uses:
-```java
-config.setAllowCredentials(true);
-config.setAllowedOriginPatterns(Arrays.asList("*"));
+### 5.1 Rejection of Blind Dual-Scheme Whitelisting
+A common but flawed pattern is blindly adding both `http://tauri.localhost` and `https://tauri.localhost` to the backend CORS configuration.
+
+**Architectural Policy for EduPulse:**
+- **Do not blindly whitelist both HTTP and HTTPS origins.**
+- Whitelisting an unencrypted HTTP origin in a production enterprise backend weakens the security posture and creates configuration ambiguity.
+- Instead, the application must **explicitly select, configure, and validate ONE production origin**.
+
+### 5.2 Recommendation: Explicit `https://tauri.localhost` via `useHttpsScheme`
+EduPulse explicitly standardizes on **`https://tauri.localhost`** for production desktop deployment by declaring in `src-tauri/tauri.conf.json`:
+
+```json
+{
+  "app": {
+    "windows": [
+      {
+        "title": "EduPulse ERP",
+        "useHttpsScheme": true
+      }
+    ]
+  }
+}
 ```
-While functional during initial prototyping, this dynamically reflects *any* origin back in `Access-Control-Allow-Origin`. If a campus faculty member visits a malicious website while logged into their browser, the malicious site can execute authenticated API requests against an on-premise ERP server reachable on the user's intranet.
 
-### 4.2 Target Production CORS Configuration
-The proposed architecture externalizes allowed origins into `application.yml`, combining institutional web FQDNs with the Tauri desktop origin:
+#### Strategic Advantages:
+1. **Secure Context Compliance:** Modern web standards (Web Crypto API, secure storage interfaces, credential management) require a Secure Context (`isSecureContext === true`). An `https://` origin satisfies this natively in WebView2.
+2. **Deterministic Backend Whitelisting:** Spring Boot whitelists strictly `https://tauri.localhost`, rejecting any unauthorized or downgraded `http://` variants.
+3. **Institutional Security Audit Compliance:** Campus security auditors require all client-facing origin definitions to reflect HTTPS.
+
+### 5.3 Target Production CORS Configuration (`application.yml`):
 
 ```yaml
-# Target application.yml configuration
 edupulse:
   security:
     cors:
       allowed-origins:
-        - "https://tauri.localhost"              # Tauri Windows Desktop Edition
-        - "http://tauri.localhost"               # Tauri legacy loopback fallback
+        - "https://tauri.localhost"              # Validated Single Desktop Production Origin
         - "https://erp.campus.edu"               # Production Institutional Web Portal
         - "https://cloud.edupulse.org"           # Multi-Tenant Cloud Web Portal
       allowed-dev-origins:
-        - "http://localhost:5173"                # Vite Web Dev Server
-        - "http://localhost:3000"                # Alternative Dev Server
-        - "http://127.0.0.1:5173"
+        - "http://localhost:5173"                # Vite Web Dev Server (Development Only)
+        - "http://localhost:3000"
       max-age-seconds: 3600
 ```
 
-### 4.3 Proposed Production `CorsConfig.java` Bean:
+### 5.4 Proposed Production `CorsConfig.java` Bean:
 ```java
 @Configuration
 public class CorsConfig {
@@ -157,7 +219,7 @@ public class CorsConfig {
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration config = new CorsConfiguration();
 
-        // Explicitly set allowed origins (Never use wildcard "*" with credentials)
+        // Explicitly set single validated production origins (Never use wildcard "*" with credentials)
         config.setAllowedOrigins(allowedOrigins);
         config.setAllowCredentials(true);
         config.setAllowedHeaders(Arrays.asList(
@@ -181,7 +243,7 @@ public class CorsConfig {
 
 ---
 
-## 5. Spring Security Filter Chain Ordering Guarantees
+## 6. Spring Security Filter Chain Ordering Guarantees
 
 In Spring Security 6 / Spring Boot 3.3.4, CORS preflight handling must occur before authentication filters to prevent unauthenticated preflight rejections.
 
@@ -210,14 +272,14 @@ In Spring Security 6 / Spring Boot 3.3.4, CORS preflight handling must occur bef
 
 ---
 
-## 6. Development vs. Production Origin Matrix
+## 7. Development vs. Production Origin Matrix
 
 ```
 +-----------------------------------+-----------------------------------+-----------------------------------+
 | Origin URI                        | Development Environment           | Production Environment            |
 +-----------------------------------+-----------------------------------+-----------------------------------+
-| `https://tauri.localhost`         | ALLOWED (Tauri desktop preview)   | ALLOWED (Primary Desktop Origin)  |
-| `http://tauri.localhost`          | ALLOWED (Debug desktop builds)    | ALLOWED (Fallback Desktop Origin) |
+| `https://tauri.localhost`         | ALLOWED (useHttpsScheme = true)   | ALLOWED (Explicit Desktop Origin) |
+| `http://tauri.localhost`          | ALLOWED (Default unconfigured dev)| REJECTED (Blocked in Production)  |
 | `http://localhost:5173`           | ALLOWED (Vite HMR dev server)     | REJECTED (Blocked)                |
 | `https://erp.campus.edu`          | OPTIONAL (Local override)         | ALLOWED (Institutional Domain)    |
 | `*` (Arbitrary Internet Origins)  | ALLOWED (Flexible development)    | REJECTED (Strict Security Rule)   |

@@ -60,8 +60,14 @@ public class CorsConfig {
 ### 2.2 Analysis of Active CORS Parameters
 1. **Allowed Origins (`setAllowedOriginPatterns(Arrays.asList("*"))`):**
    - **Current State:** The backend currently accepts requests from **any origin** using wildcard matching.
-   - **Tauri Compatibility:** Because `*` matches everything, requests from Tauri's custom Windows scheme (`https://tauri.localhost` or `http://tauri.localhost`) are accepted by default.
-   - **Security Risk:** Combining `allowCredentials(true)` with broad wildcard origin matching is considered an anti-pattern in production enterprise systems. While modern browsers forbid `Access-Control-Allow-Origin: *` with credentials, Spring's `allowedOriginPatterns("*")` dynamically echoes back the incoming `Origin` header, effectively permitting any malicious website running in the user's browser to make authenticated cross-origin requests if cookies or ambient credentials are used.
+   - **Tauri Windows Origin Behavior:**
+     - Under official Tauri v2 specifications on Windows, the default WebView2 origin scheme is **`http://tauri.localhost`**.
+     - Tauri v2 allows explicitly configuring `app.windows[].useHttpsScheme = true` in `tauri.conf.json`, which elevates the local WebView origin to **`https://tauri.localhost`**.
+     - Because `*` currently matches everything, requests from either scheme are accepted during development prototyping.
+   - **Crucial Distinction: Local WebView Origin vs. HTTPS Backend Connection:**
+     - The **local WebView origin** (`http://tauri.localhost` or `https://tauri.localhost`) is strictly the internal origin used by WebView2 to load local HTML/JS/CSS assets bundled inside the binary.
+     - The **backend API connection** is the external network transport channel over which REST calls travel to Spring Boot (`https://erp.campus.edu:8081`). This connection **must always be encrypted over TLS/HTTPS**, regardless of the local webview scheme.
+   - **Security Risk & Production Rule:** Combining `allowCredentials(true)` with broad wildcard origin matching is considered an anti-pattern in production enterprise systems. In production, the backend must **not blindly whitelist both HTTP and HTTPS variants**. Instead, the architecture must explicitly select and validate **one production desktop origin (`https://tauri.localhost`)** by setting `useHttpsScheme = true` in Tauri, and restricting the backend CORS whitelist to that single origin.
 2. **Allowed Methods:**
    - Explicitly permits `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, and `OPTIONS`. Fully satisfies all 259 planned ERP modules.
 3. **Allowed Headers:**
@@ -156,7 +162,8 @@ export const apiClient = axios.create({
 +-----------------------------------+-----------------------------------+-----------------------------------+
 | Problem / Risk Area               | Web Browser Execution             | Tauri WebView2 Execution          |
 +-----------------------------------+-----------------------------------+-----------------------------------+
-| Origin Header Value               | `http://localhost:5173` or Domain | `https://tauri.localhost`         |
+| Origin Header Value               | `http://localhost:5173` or Domain | `http://tauri.localhost` (Default)|
+|                                   |                                   | `https://tauri.localhost` (useHttpsScheme)|
 | Relative Base URL (`/api`)        | Resolves to host web server       | FAILS: Resolves to local files    |
 | Protocol Scheme                   | Standard HTTP / HTTPS             | Windows custom URI scheme         |
 | Direct IPC Bypass vs Axios        | Standard browser network stack    | Can use Axios or Tauri HTTP       |
@@ -167,6 +174,6 @@ export const apiClient = axios.create({
 
 ### Critical Risk Summary:
 1. **The Relative URL Trap:** The fallback `'/api'` in `api.ts:6` breaks completely inside WebView2. The desktop edition must be supplied with an absolute URL (`https://<hostname>:<port>`).
-2. **Wildcard Origin Hardening:** In production, `setAllowedOriginPatterns(Arrays.asList("*"))` must be tightened to recognize `https://tauri.localhost` alongside institutional web domains while avoiding unrestricted wildcards.
+2. **Deterministic Origin Selection:** Avoid ambiguous multi-scheme whitelisting. Set `app.windows.useHttpsScheme = true` in `tauri.conf.json` and restrict production CORS whitelist specifically to `https://tauri.localhost` alongside institutional web domains.
 
 Proceed to **Work Package 05B: Tauri WebView2 CORS Architecture**.

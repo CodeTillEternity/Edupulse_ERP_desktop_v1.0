@@ -186,6 +186,7 @@ sequenceDiagram
 ### Routing Rules:
 1. **Direct HTTPS for Online Requests:** When online, React communicates directly with Spring Boot over standard HTTPS using Axios. This avoids serializing massive JSON payloads through Tauri IPC and leverages browser-level HTTP keep-alive, streaming, and connection pooling.
 2. **IPC Exclusively for Native & Offline Access:** Tauri IPC is engaged exclusively when offline queries are necessary, when storing/retrieving credentials, or when invoking native OS capabilities.
+3. **Enterprise Forward Proxy Compatibility (NTLM/Kerberos):** In campus networks requiring authenticated forward proxies, Axios within WebView2 automatically leverages Windows Internet Options (WinINet) for transparent NTLM/Kerberos authentication, while the Rust background synchronization engine connects via Windows SSPI to avoid HTTP 407 proxy authentication challenges.
 
 ---
 

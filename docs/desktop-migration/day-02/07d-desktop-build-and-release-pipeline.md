@@ -130,9 +130,16 @@ The desktop build and release pipeline is structured into four independent workf
 
 ---
 
-## 5. Production Release Workflow Specification (`desktop-release.yml`)
+## 5. Production Release Workflow and Code Signing Architecture
 
-The following specification details the proposed production release workflow:
+### 5.1 Code Signing Options Evaluation
+
+To ensure installers and binaries are trusted by Windows Defender SmartScreen:
+1. **EV Certificates are NOT Mandatory:** Windows does not strictly require Extended Validation (EV) certificates to execute binaries. Standard Organization Validation (OV) Authenticode, EV, or Azure Trusted Signing can all be used.
+2. **Azure Trusted Signing (Recommended):** Microsoft's fully managed, cloud-native signing service. It eliminates physical USB hardware tokens, integrates cleanly into GitHub Actions via `azure/trusted-signing-action`, and establishes fast SmartScreen reputation because identity is verified directly through Microsoft.
+3. **SmartScreen Dynamics:** New certificates initially show a SmartScreen warning until download volume establishes reputation. In managed campus networks, IT administrators bypass this entirely by pushing the public certificate to the **Trusted Publishers** store via Active Directory GPO.
+
+### 5.2 Release Workflow Specification (`desktop-release.yml`)
 
 ```yaml
 name: Desktop Production Release
@@ -152,6 +159,7 @@ jobs:
     runs-on: windows-2022
     permissions:
       contents: write
+      id-token: write # Required for Azure Trusted Signing OIDC
 
     steps:
       - name: Checkout Code
@@ -187,15 +195,31 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
         run: npx tauri build
 
-      - name: Sign Windows Installers (Authenticode)
-        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+      # Recommended Option: Azure Trusted Signing (Cloud HSM via OIDC)
+      - name: Azure Trusted Signing
+        if: env.AZURE_TRUSTED_SIGNING_ENABLED == 'true'
+        uses: azure/trusted-signing-action@v0.4.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files-folder: Institutioanl_ERP_v1.0-main/Institutioanl_ERP_v1.0/frontend-v2/src-tauri/target/release/bundle
+          files-folder-filter: msi,exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Alternative Option: Traditional Authenticode (OV/EV Certificate via signtool)
+      - name: Fallback Authenticode Signing
+        if: env.AZURE_TRUSTED_SIGNING_ENABLED != 'true' && env.WINDOWS_CERTIFICATE_BASE64 != ''
         working-directory: Institutioanl_ERP_v1.0-main/Institutioanl_ERP_v1.0/frontend-v2/src-tauri/target/release/bundle
         env:
           WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
-          # Decoding certificate and executing signtool sign /fd SHA256 ...
-          Write-Host "Executing production Authenticode signing..."
+          Write-Host "Signing bundles using signtool and RFC 3161 timestamp..."
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

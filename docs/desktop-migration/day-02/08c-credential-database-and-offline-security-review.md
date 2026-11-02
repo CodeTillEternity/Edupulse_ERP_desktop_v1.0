@@ -6,7 +6,7 @@
 This document consolidates and reconciles the security architectures defined in **WP03 (Secure Credential Storage Architecture)** and **WP06 (Offline Architecture Design)**.
 
 It evaluates the confidentiality, integrity, and lifecycle of sensitive data stored on Windows endpoints across three cryptographic tiers:
-1. **Tier 1 (In-Memory Ephemeral State):** Short-lived JWT access tokens and decrypted session state.
+1. **Tier 1 (In-Memory Ephemeral State):** Short-lived JWT access tokens and decrypted session state held in RAM.
 2. **Tier 2 (Windows DPAPI Secret Vault):** Long-lived refresh tokens, offline session snapshots, and database encryption keys.
 3. **Tier 3 (SQLCipher Encrypted Local Storage):** Cached institutional records, student directories, timetables, and academic circulars.
 
@@ -16,7 +16,7 @@ It evaluates the confidentiality, integrity, and lifecycle of sensitive data sto
 
 | Cryptographic System | Implementation Mechanism | Cryptographic Primitive | Operating Scope | Threat Mitigation |
 | :--- | :--- | :--- | :--- | :--- |
-| **Windows DPAPI** (`Crypt32.dll`) | Kernel-level Data Protection API tied to Windows User SID and logon password. | Triple-DES / AES-256 with PBKDF2 Master Key derivation. | Per-User Scope (`CRYPTPROTECT_UI_FORBIDDEN`) + Application Entropy Salt. | Prevents credential theft across separate Windows user accounts and offline disk imaging without user password. |
+| **Windows DPAPI** (`Crypt32.dll`) | Kernel-level Data Protection API tied to Windows User SID and logon credentials. | Triple-DES / AES-256 with PBKDF2 Master Key derivation. | Per-User Scope (`CRYPTPROTECT_UI_FORBIDDEN`) + Application Entropy Salt. | Prevents credential theft across separate Windows user accounts and offline disk imaging without user password. |
 | **SQLCipher Engine** (`rusqlite` bundled) | Transparent page-level database encryption extension for SQLite. | AES-256-CBC page encryption + HMAC-SHA256 page authentication (4096-byte pages). | Isolated in Rust native process; 100% ciphertext footprint on filesystem. | Protects student PII and academic records at rest; defeats raw disk recovery and hex-editing tampering. |
 
 ---
@@ -78,15 +78,24 @@ When raw keys or tokens are in memory:
 
 ---
 
-## 5. Multi-User Windows Isolation and Institution Switching
+## 5. Multi-User Windows Environments, Shared Profiles, and Institution Switching
 
-### 5.1 Multi-User Windows Workstations
-On computers with multiple distinct Windows user profiles:
+### 5.1 Multi-User Windows Workstations (Separate Windows Accounts)
+On computers configured with separate Windows user accounts (e.g. `UserA` and `UserB` each having their own Windows login):
 - Windows NTFS Access Control Lists (DACLs) restrict `C:\Users\<User>\AppData\Roaming\com.edupulse.erp\` to that specific user's SID and `NT AUTHORITY\SYSTEM`.
-- Windows DPAPI binds the master key to the user's Windows login credentials. Even if User B possesses Administrator privileges and copies User A's `cache.db` and `db.key.dpapi`, `CryptUnprotectData` fails with `SEC_E_DECRYPT_FAILURE`.
+- Windows DPAPI binds the master key to the user's Windows login credentials. Even if `UserB` possesses Administrator privileges and copies `UserA`'s `cache.db` and `db.key.dpapi`, `CryptUnprotectData` fails with `SEC_E_DECRYPT_FAILURE`.
 
-### 5.2 Multi-Institution Switching Protocol
-If a user switches backend URLs (e.g. transferring between campus branches), the application executes a mandatory **Crypto-Shredding Sequence**:
+### 5.2 Shared Generic Windows Accounts: DPAPI Isolation Failure
+In many educational institutions, multiple teachers or lab students share a single generic Windows account (e.g. `staff_room_pc` or `lab_student`).
+- **Critical Failure Mode:** Windows DPAPI user scope derives master keys from the logged-in Windows user's SID and Windows account credentials. **Because all teachers share the same Windows profile, DPAPI `CryptUnprotectData` will successfully decrypt any data encrypted under that Windows profile!**
+- **DPAPI provides ZERO isolation between different EduPulse users sharing a single Windows login.**
+- **Required Architectural Mitigations:**
+  1. **Application-Level Master PIN / Password:** EduPulse Desktop must require an application-specific offline master PIN to decrypt and unlock local session state.
+  2. **Mandatory Explicit Logout:** Users on shared generic PCs must click "Logout" in EduPulse, which explicitly unlinks `refresh.dpapi` and zeroizes memory keys.
+  3. **Enterprise Group Policy Control:** Campus IT can deploy the policy `PurgeCacheOnLogout = 1`, which unconditionally deletes `cache.db` and `db.key.dpapi` whenever the application exits.
+
+### 5.3 Multi-Institution Switching Protocol: Realistic Cryptographic Erasure
+If a user switches backend URLs (e.g. transferring between campus branches), the application executes a mandatory **Cryptographic Erasure (Crypto-Shredding)** sequence:
 
 ```mermaid
 sequenceDiagram
@@ -96,15 +105,16 @@ sequenceDiagram
     participant DB as cache.db / WAL
     participant Auth as refresh.dpapi
 
-    App->>App: Close active SQLite connection pool & zeroize memory
-    App->>Key: Overwrite with 3 passes of CSPRNG bytes
-    App->>Key: Unlink db.key.dpapi from disk
+    App->>App: Close active SQLite connection pool & zeroize memory buffers
+    App->>Key: Unlink db.key.dpapi from filesystem
     App->>DB: Unlink cache.db, cache.db-wal, and cache.db-shm
-    App->>Auth: Overwrite with CSPRNG bytes & unlink refresh.dpapi
-    App->>App: Reset application state to unauthenticated
+    App->>Auth: Unlink refresh.dpapi from filesystem
+    App->>App: Reset application state to pristine unauthenticated state
 ```
 
-This guarantees zero cross-institutional data leakage, even against forensic flash recovery tools.
+#### Realistic SSD Wear-Leveling Realities:
+- On modern NAND flash Solid State Drives (SSDs), software-level multi-pass overwrites (e.g. DoD 3-pass wiping) are **ineffective** because the SSD controller firmware redirects writes to new physical flash cells via wear-leveling algorithms.
+- **Why Cryptographic Erasure Works:** The data in `cache.db` is stored as AES-256-CBC ciphertext. By deleting the 256-bit DPAPI encryption key (`db.key.dpapi`) and zeroizing RAM buffers, all residual physical NAND blocks containing `cache.db` ciphertext are rendered mathematically unrecoverable, providing instantaneous and forensically sound data destruction.
 
 ---
 
@@ -122,16 +132,26 @@ Operating in a disconnected state introduces an unavoidable physical limitation:
 
 ---
 
-## 7. Unresolved Cryptographic Design Decisions
+## 7. Hardware-Backed Key Protection: CNG Platform Crypto Provider vs. Ordinary DPAPI
 
-The security review identifies two unresolved cryptographic decisions that require institutional policy sign-off:
+A critical technical distinction must be maintained between ordinary DPAPI and true hardware-backed key protection:
 
-1. **Hardware-Backed TPM 2.0 Key Sealing:**
-   - *Current Design:* Standard Windows DPAPI tied to user Windows login password.
-   - *Alternative:* Binding DPAPI keys to Windows Virtualization-Based Security (VBS) and TPM 2.0 hardware PCR registers (`CRYPTPROTECT_SYSTEM`).
-   - *Trade-off:* TPM sealing prevents key decryption if the SSD is moved to another identical motherboard, but fails on older campus laptops lacking TPM 2.0 or running legacy Windows installations.
-   - *Recommendation:* Maintain user-scoped DPAPI as the default; allow enterprise Group Policy to mandate TPM sealing on managed institutional hardware.
-2. **Single-PC Generic Login Partitioning:**
-   - *Current Design:* One local offline database per Windows user profile.
-   - *Limitation:* If multiple teachers share a single generic Windows account (`staff_room_pc`), they share the same offline database file.
-   - *Recommendation:* Require individual application-level user logout, which purges the in-memory key, and mandate `PurgeCacheOnLogout = 1` via GPO on shared generic workstations.
+### 7.1 Ordinary DPAPI (Software-Based)
+- Standard Windows DPAPI (`CryptProtectData`) is a **software-based cryptographic mechanism**.
+- It derives master keys from the user's Windows logon password hash and stores encrypted master keys in `%APPDATA%\Microsoft\Protect\<SID>\`.
+- While highly effective against other local users and offline disk imaging, it is **not** tied to the machine's hardware security module (TPM) by default.
+
+### 7.2 Hardware-Backed Windows Cryptography Options
+When enterprise institutions require hardware-bound key security:
+1. **Windows CNG with Microsoft Platform Crypto Provider (PCP):**
+   - Cryptography Next Generation (CNG) integrates with the physical **TPM 2.0 (Trusted Platform Module)** silicon.
+   - Keys generated via the Microsoft Platform Crypto Provider are sealed inside the TPM hardware chip and can be bound to Platform Configuration Registers (PCRs).
+   - Keys cannot be extracted or exported even by administrative kernel drivers.
+2. **Virtualization-Based Security (VBS) & Credential Guard:**
+   - Isolates cryptographic operations within an isolated virtualized container (Isolated User Mode / VSM), preventing memory-scraping attacks even from local Administrator processes.
+3. **Windows Hello for Business:**
+   - Employs asymmetric key pairs generated inside the TPM, released only upon successful user biometric (fingerprint/facial recognition) or PIN verification.
+
+### 7.3 Architectural Recommendation
+- Maintain **user-scoped DPAPI with application entropy** as the universal baseline for EduPulse Desktop, ensuring full compatibility across all Windows 10/11 editions without requiring specialized TPM configurations.
+- Provide an enterprise configuration flag allowing managed institutional devices with TPM 2.0 to utilize CNG Platform Crypto Provider key sealing via institutional Group Policy.

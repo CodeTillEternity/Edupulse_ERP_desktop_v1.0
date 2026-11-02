@@ -71,12 +71,23 @@ An essential architectural distinction exists between the local rendering origin
   `https://tauri.localhost` (configured via `app.windows[].useHttpsScheme = true`).
 - **Remote API Connection:** Axios and Tauri sync workers make HTTPS network requests to the remote institutional backend (e.g. `https://erp.institution.edu`).
 
-### 3.2 Spring Boot CORS Policy (`CorsConfig.java`)
+### 3.2 Reconciliation with WP05 and Existing Backend `CorsConfig.java`
 
-To permit legitimate desktop requests without exposing the backend to unauthorized web origins:
+An empirical inspection of the existing backend `backend/src/main/java/com/erp/config/CorsConfig.java` reveals:
 
 ```java
-// Production Spring Boot CORS Configuration (CorsConfig.java)
+// Existing Backend CORS Configuration
+config.setAllowCredentials(true);
+config.setAllowedOriginPatterns(Arrays.asList("*"));
+```
+
+#### Reconciled CORS Architecture Findings:
+1. **Existing Backend Origin Acceptance:** Because the existing backend utilizes `setAllowedOriginPatterns(Arrays.asList("*"))`, Spring dynamically reflects back whatever `Origin` header the client sends. Consequently, the existing backend **does NOT reject** `https://tauri.localhost` at runtime.
+2. **The Production Wildcard Exposure:** Permitting wildcard origin patterns (`*`) while enabling credentials (`allowCredentials(true)`) creates an **overly permissive security exposure** in production. Any malicious website loaded in a browser by an authenticated faculty member could potentially execute authenticated cross-origin requests against the institutional backend.
+3. **Required Production Hardening (WP05 Alignment):** Production environments must replace `allowedOriginPatterns("*")` with an explicit whitelist:
+
+```java
+// Recommended Production Spring Boot CORS Configuration (CorsConfig.java)
 @Configuration
 public class CorsConfig {
     @Bean
@@ -102,10 +113,6 @@ public class CorsConfig {
     }
 }
 ```
-
-#### CORS Security Rules:
-1. **No Wildcard with Credentials:** Setting `allowedOrigins("*")` combined with `setAllowCredentials(true)` is strictly prohibited and rejected by modern browsers.
-2. **Explicit HTTPS Origin Selection:** Only `https://tauri.localhost` is whitelisted. Insecure `http://tauri.localhost` is never permitted in production CORS configurations.
 
 ---
 

@@ -6,8 +6,8 @@
 This document defines the comprehensive threat model, architectural trust boundaries, and attack surface analysis for **EduPulse ERP Windows Desktop Edition**.
 
 The transition from a pure browser-based web application to a hybrid desktop application (Tauri v2 + React 19.2 + Rust native core + Spring Boot 3.3.4 + PostgreSQL) alters the security landscape:
-- It eliminates standard browser-based token extraction attacks via `localStorage` by moving persistent secrets into Windows DPAPI.
-- It introduces new attack surfaces: the Tauri Inter-Process Communication (IPC) bridge, local file system storage, offline encrypted databases (SQLCipher), native installer binaries, and unattended institutional desktop endpoints.
+- **Separation of Web vs. Desktop Token Storage:** The existing web application stores JWT tokens in browser `localStorage`, leaving them vulnerable to web-tier script access. The proposed desktop architecture eliminates `localStorage` entirely, retaining short-lived access tokens exclusively in JavaScript memory and vaulting persistent refresh tokens via Windows DPAPI.
+- **New Attack Surfaces:** The desktop environment introduces new boundaries: the Tauri Inter-Process Communication (IPC) bridge, local file system storage, offline encrypted databases (SQLCipher), native installer binaries, and shared institutional Windows desktop endpoints.
 
 ---
 
@@ -28,7 +28,7 @@ The desktop application handles highly regulated educational, administrative, an
 
 ## 3. Threat Actors and Adversary Profiles
 
-EduPulse ERP operates across diverse institutional environments ranging from elite university campuses to rural school networks. The threat model accounts for six primary threat actor profiles:
+EduPulse ERP operates across diverse institutional environments ranging from modern university campuses to shared computer labs. The threat model accounts for six primary threat actor profiles:
 
 ```mermaid
 flowchart TD
@@ -36,9 +36,9 @@ flowchart TD
         A1[1. Remote External Attacker: Network MITM, DNS spoofing, Wi-Fi sniffing]
         A2[2. Malicious / Rogue Insider: Disgruntled staff, compromised faculty account]
         A3[3. Local Host Malware: Commodity trojans, infostealers running as standard user]
-        A4[4. Shared PC Secondary User: Student or guest using same Windows machine]
+        A4[4. Shared PC Secondary User: Colleague or student using same Windows profile]
         A5[5. Physical Endpoint Thief: Stolen laptop, unauthorized physical access to SSD]
-        A6[6. Rogue / Compromised Server: Malicious endpoint URL or man-in-the-middle gateway]
+        A6[6. Rogue / Compromised Server: Malicious endpoint URL or MITM gateway]
     end
 
     subgraph Desktop Application Boundaries
@@ -48,8 +48,8 @@ flowchart TD
     A1 -.->|Network Interception| App
     A2 -.->|Privilege Abuse| App
     A3 -.->|Process & Memory Snooping| App
-    A4 -.->|Filesystem & DPAPI Probing| App
-    A5 -.->|Cold Boot & Flash Recovery| App
+    A4 -.->|Shared Filesystem & DPAPI Probing| App
+    A5 -.->|Cold Boot & Flash Extraction| App
     A6 -.->|Malicious Payloads & Health Spoofing| App
 
     style Adversary Profiles fill:#ffebee,stroke:#c62828,stroke-width:2px
@@ -101,7 +101,7 @@ flowchart LR
 ```
 
 ### Trust Boundary Definitions:
-1. **Boundary 1 (WebView to Rust IPC):** The React frontend is treated as **untrusted** for security decision-making. JavaScript execution can be affected by third-party npm dependencies or DOM XSS. Rust native commands enforce strict argument validation and never trust raw frontend assertions.
+1. **Boundary 1 (WebView to Rust IPC):** The React frontend is treated as **untrusted** for security decision-making. JavaScript execution can be hijacked by third-party npm vulnerabilities or DOM XSS. **Crucially: Injected JavaScript can execute `window.__TAURI__.core.invoke()`.** Therefore, the native layer must implement command-level authorization, strict argument validation, and data minimization rather than assuming IPC invocations are inherently benign.
 2. **Boundary 2 (Rust Shell to Windows OS):** The boundary between native application code and Windows OS security primitives (`Crypt32.dll`, NTFS DACLs, Windows Registry).
 3. **Boundary 3 (Client Endpoint to Campus WAN):** The network transport boundary. All communication must traverse TLS 1.3/1.2; campus networks are assumed to be hostile and subject to packet inspection or DNS manipulation.
 4. **Boundary 4 (Network to Spring Boot Backend):** The authoritative perimeter. Spring Security filters, JWT authentication, role-based authorization, and CORS policies are enforced here.
@@ -111,13 +111,15 @@ flowchart LR
 
 ## 5. STRIDE Threat Scenarios and Analysis
 
-Each STRIDE category is evaluated against the desktop architecture:
-
 ### 5.1 Spoofing (Identity & Origin)
 - **Scenario S-01: Rogue Backend Endpoint Spoofing:** An attacker on the local network uses DNS poisoning or DHCP spoofing to redirect `erp.institution.edu` to a rogue server.
   - *Mitigation:* Strict TLS certificate chain validation via the Windows System Trust Store. HTTP cleartext is prohibited; invalid or self-signed certificates without an installed institutional root CA are rejected.
-- **Scenario S-02: Local User Impersonation on Shared Windows PC:** Student B launches EduPulse on a shared library PC previously used by Teacher A.
-  - *Mitigation:* In multi-user Windows environments, distinct Windows accounts isolate `%APPDATA%` and DPAPI keys. In generic Windows shared accounts, EduPulse requires an offline master PIN or Windows Hello biometric proof to unlock an offline session.
+- **Scenario S-02: Shared Generic Windows Account Impersonation:** On shared institutional workstations (e.g. staff rooms or laboratories), multiple users frequently share a single generic Windows user account (`staff_user`).
+  - *Vulnerability Analysis:* Windows DPAPI user scope binds encryption keys to the active Windows user SID and logon password. **Because all users share the identical Windows login session, DPAPI `CryptUnprotectData` provides ZERO isolation between different EduPulse users.** Any user logging into Windows can decrypt previously saved DPAPI credentials belonging to another teacher.
+  - *Required Mitigations:*
+    1. Require an application-level PIN or password challenge before loading offline credentials.
+    2. Mandate application logout on shared workstations, which explicitly deletes vaulted tokens.
+    3. Support an enterprise GPO policy `PurgeCacheOnLogout = 1` that wipes local cache and DPAPI keys upon process exit.
 
 ### 5.2 Tampering (Data & Binary Integrity)
 - **Scenario T-01: Local SQLCipher Database Tampering:** An attacker with local user access attempts to hex-edit `cache.db` to alter student grades.
@@ -131,17 +133,23 @@ Each STRIDE category is evaluated against the desktop architecture:
 
 ### 5.4 Information Disclosure (Confidentiality)
 - **Scenario I-01: Memory Scraping of Access Tokens:** Infostealer malware running under the same Windows account scans process memory for JWTs.
-  - *Mitigation:* Access tokens are strictly short-lived (15 minutes maximum), reducing exposure duration. Refresh tokens are never held in plaintext in memory; they are loaded into memory solely during rotation and immediately zeroized using `zeroize`.
+  - *Mitigation:* Access tokens are strictly short-lived (15 minutes maximum), reducing exposure duration. Refresh tokens are never held in plaintext in long-term memory; they are vaulted in DPAPI and loaded into memory solely during token refresh, with buffers zeroized immediately after use.
 - **Scenario I-02: Diagnostic Log Data Leakage:** Diagnostic logs exported for IT support contain sensitive student records or Bearer tokens.
   - *Mitigation:* Primary defense: structured logging allowlist prohibiting raw payload capture. Secondary defense: regex redaction scrubbing all tokens, passwords, and government IDs before writing logs to disk.
+- **Scenario I-03: Forensic Data Recovery on Discarded SSDs:** An attacker acquires a decommissioned institution laptop and attempts to recover student data from SSD NAND flash cells.
+  - *Realistic Cryptographic Erasure Analysis:* Wear-leveling and bad-block remapping prevent traditional multi-pass file shredding from reliably overwriting physical flash cells. Instead, EduPulse relies on **Cryptographic Erasure (Crypto-Shredding)**: deleting the DPAPI-encrypted 256-bit AES master key (`db.key.dpapi`) renders the residual `cache.db` ciphertext blocks across the SSD flash media mathematically unrecoverable.
 
 ### 5.5 Denial of Service (Availability)
 - **Scenario D-01: Intentional Cache Corruption to Crash Endpoint:** A malicious user corrupts `cache.db` to cause startup crash loops during examination periods.
   - *Mitigation:* Fast startup integrity check (`PRAGMA quick_check;`) detects corruption, renames the damaged database to `.corrupt.<timestamp>`, initializes a clean schema, and alerts the user without crashing the process.
 
 ### 5.6 Elevation of Privilege (Authorization Bypass)
-- **Scenario E-01: IPC Abuse via Frontend XSS:** A malicious npm dependency executes script in the WebView, attempting to execute arbitrary commands or steal files.
-  - *Mitigation:* Declarative Tauri capabilities omit generic filesystem (`fs:*`) and shell (`shell:*`) permissions. Exposed Rust commands accept only strongly-typed DTOs with strict range and boundary validation.
+- **Scenario E-01: IPC Abuse via Frontend XSS:** A compromised dependency or DOM XSS executes within the WebView and invokes exposed Tauri IPC commands.
+  - *Realistic Threat Assessment:* Injected script can execute `tauri.invoke('vault_get_refresh_token')` or `tauri.invoke('query_offline_cache')` because it runs in the origin context of the window.
+  - *Mitigations & Native Guardrails:*
+    1. **Command-Level Authorization:** Rust native commands verify active caller state and permissions snapshot before returning sensitive data.
+    2. **Data Minimization Across IPC:** Never return database encryption keys or master credentials across IPC.
+    3. **Backend Refresh Token Rotation:** Note that while token rotation revokes the individual old token, the existing backend does **NOT** currently invalidate descendant token families on reuse. Implementing complete refresh token family invalidation remains a required backend security enhancement.
 
 ---
 
@@ -150,16 +158,16 @@ Each STRIDE category is evaluated against the desktop architecture:
 | Threat ID | STRIDE Category | Threat Description | Severity | Likelihood | Impact | Mitigation Strategy | Residual Risk |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **TR-01** | Spoofing | Rogue backend server redirects client | Critical | Medium | High | Strict TLS verification; HSTS; disable cleartext HTTP | Low |
-| **TR-02** | Spoofing | Offline access by unauthorized secondary user | High | Medium | High | Offline master PIN / Windows Hello biometric lock | Low |
+| **TR-02** | Spoofing | Multi-user impersonation on shared Windows generic profile | Critical | High | Critical | DPAPI user scope cannot isolate shared accounts; requires app PIN challenge & `PurgeCacheOnLogout` | Medium (Requires IT Policy) |
 | **TR-03** | Tampering | Hex-editing local SQLite cache to alter records | High | Low | High | SQLCipher AES-256-CBC + HMAC-SHA256 page checks | Very Low |
 | **TR-04** | Tampering | Malicious binary pushed via auto-updater | Critical | Low | Critical | Dual verification: Minisign signature + Authenticode | Very Low |
 | **TR-05** | Tampering | Modifying backend URL in registry without rights | High | Low | High | Stored in `HKLM\SOFTWARE\Policies` (Admin-only DACL) | Very Low |
 | **TR-06** | Repudiation | Unlogged offline student record access | Medium | Medium | Medium | Encrypted local audit queue synced on reconnect | Low |
-| **TR-07** | Info Disclosure| Plaintext token theft via WebView localStorage | Critical | High | Critical | **Resolved:** Replaced with in-memory + Windows DPAPI | Very Low |
-| **TR-08** | Info Disclosure| Forensic extraction of student PII from SSD | High | Low | High | Transparent SQLCipher page encryption + Crypto-shredding | Low |
+| **TR-07** | Info Disclosure| Web app token theft via browser `localStorage` | Critical | High | Critical | **Web vs Desktop:** Existing web app uses `localStorage`; proposed desktop architecture eliminates it via DPAPI | Low (Desktop) / High (Web) |
+| **TR-08** | Info Disclosure| Forensic extraction of student PII from SSD | High | Low | High | SQLCipher page encryption + Cryptographic Erasure (deleting DPAPI key file) | Low |
 | **TR-09** | Info Disclosure| PII / Credential leakage in diagnostic logs | High | Medium | High | Structured allowlist logging + regex redaction | Very Low |
 | **TR-10** | DoS | Corrupt database causes permanent startup crash | High | Medium | High | Startup quick check + quarantine self-healing | Very Low |
 | **TR-11** | DoS | Unbounded WebView cache exhausts disk space | Medium | High | Low | Local storage pruning + quota monitoring | Low |
-| **TR-12** | Elevation | XSS escaping WebView to execute shell commands | Critical | Low | Critical | Least privilege capabilities: zero shell/fs access | Very Low |
+| **TR-12** | Elevation | XSS invoking exposed Tauri IPC commands | High | Medium | High | Command-level native guards, least-privilege capabilities, data minimization | Medium |
 | **TR-13** | Elevation | Offline mutation of attendance or grade data | Critical | Medium | Critical | Strictly read-only offline architecture | Zero |
-| **TR-14** | Elevation | Backend token validity not checked on deactivation| Critical | High | Critical | **Existing Backend Defect:** Requires backend fix | Medium (Pending Fix) |
+| **TR-14** | Elevation | Token reuse does not revoke token family on backend | High | Medium | High | **Existing Backend Defect:** Backend only revokes individual token; family invalidation required | High (Pending Backend Fix) |

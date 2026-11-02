@@ -5,7 +5,9 @@
 
 The Inter-Process Communication (IPC) bridge connects the untrusted React 19 presentation layer (running within the Microsoft Edge WebView2 rendering engine) to the privileged Tauri Rust native shell.
 
-In hybrid desktop applications, the IPC bridge is the primary boundary between web vulnerabilities (such as Cross-Site Scripting / XSS or malicious npm dependencies) and native operating system privileges. If the IPC surface is over-permissioned, a minor DOM-based XSS vulnerability can escalate into arbitrary command execution, local file system compromise, or host takeover.
+In hybrid desktop applications, the IPC bridge is the primary boundary between web vulnerabilities (such as Cross-Site Scripting / XSS or malicious npm dependencies) and native operating system privileges.
+
+**Critical Architectural Reality:** If an attacker achieves script execution (DOM XSS) inside the WebView, that script executes with the full privileges of the JavaScript environment, including the ability to invoke any Tauri IPC command exposed to that window (`window.__TAURI__.core.invoke()`). Therefore, client-side isolation alone cannot secure native capabilities; security must be enforced through **command-level native authorization, strict least privilege, and aggressive data minimization**.
 
 ---
 
@@ -74,7 +76,7 @@ In Tauri v2, permissions are scoped declaratively via capabilities files located
 
 ## 4. Blast-Radius Analysis: Containing Frontend XSS
 
-A fundamental design requirement is that **a catastrophic DOM XSS vulnerability in React must not compromise host integrity or database encryption keys**.
+Because an adversary with DOM XSS can programmatically invoke exposed IPC commands via `window.__TAURI__.core.invoke()`, the native layer must assume that any request originating from the WebView may be hostile.
 
 ```mermaid
 flowchart TD
@@ -84,43 +86,48 @@ flowchart TD
 
     subgraph What Attacker CANNOT Do
         C1[CANNOT Execute Shell or Spawn OS Processes: No shell:execute capability]
-        C2[CANNOT Read Host Filesystem: No fs:read capability]
-        C3[CANNOT Steal SQLCipher AES Key: Key is isolated in Rust memory]
-        C4[CANNOT Write Directly to SQLite: Prepared statements only]
+        C2[CANNOT Read Host Filesystem: No generic fs capabilities]
+        C3[CANNOT Steal SQLCipher AES Key: Key is isolated in Rust process heap]
+        C4[CANNOT Execute Arbitrary SQL: Prepared statements only]
         C5[CANNOT Alter Backend URL if GPO Locked: Protected in HKLM Registry]
     end
 
-    subgraph What Attacker COULD Attempt
-        A1[Attempt to call vault_get_refresh_token via IPC]
-        A2[Attempt to query cached student records via IPC]
+    subgraph What Attacker COULD Attempt via IPC
+        A1[Call vault_get_refresh_token to steal persistent token]
+        A2[Call query_offline_cache to extract cached records]
     end
 
-    subgraph Containment & Defenses
-        D1[Strict Token Rotation: Backend invalidates token family on reuse]
-        D2[Role Snapshot Guard: Attacker can only query records permitted to active user]
+    subgraph Native Defenses & Data Minimization
+        D1[Data Minimization: Rust never returns master keys or raw credentials]
+        D2[Command-Level RBAC: Rust validates role snapshot before returning cache]
+        D3[Backend Gap: Existing backend revokes single token, NOT entire family]
     end
 
-    XSS -.->|Blocked| C1
-    XSS -.->|Blocked| C2
-    XSS -.->|Blocked| C3
-    XSS -.->|Blocked| C4
-    XSS -.->|Blocked| C5
+    XSS -.->|Blocked by Capability Sandbox| C1
+    XSS -.->|Blocked by Capability Sandbox| C2
+    XSS -.->|Blocked by Memory Isolation| C3
+    XSS -.->|Blocked by Prepared Statements| C4
+    XSS -.->|Blocked by NTFS DACL| C5
 
-    XSS --> A1
-    XSS --> A2
+    XSS -->|Invokes Exposed Command| A1
+    XSS -->|Invokes Exposed Command| A2
     A1 --> D1
     A2 --> D2
+    A1 -.->|Exposes Gap| D3
 
     style Attacker Vector fill:#ffebee,stroke:#c62828,stroke-width:2px
     style What Attacker CANNOT Do fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    style What Attacker COULD Attempt fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    style Containment & Defenses fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
+    style What Attacker COULD Attempt via IPC fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    style Native Defenses & Data Minimization fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
 ```
 
-### Exploit Resistance Details:
-1. **Database Key Inaccessibility:** The 256-bit AES-256 SQLCipher encryption key is generated, decrypted, and held exclusively within the Rust process heap. There is no IPC command to request, return, or export the key.
-2. **Strict Token Rotation Defense:** Even if an XSS script calls `vault_get_refresh_token` and exfiltrates the refresh token over the network, Spring Boot's single-use token rotation ensures that when either the legitimate user or the attacker attempts to refresh, the backend detects reuse and permanently terminates the entire token family.
-3. **No Dynamic SQL Execution:** An attacker cannot execute SQL injection through the IPC bridge because `query_offline_cache` maps input parameters to pre-compiled positional SQLite queries (`SELECT ... WHERE student_id = ?`).
+### 4.1 Native Command-Level Authorization and Data Minimization
+
+To contain the impact of XSS invoking exposed commands:
+1. **Database Key Inaccessibility:** The 256-bit AES-256 SQLCipher encryption key is held exclusively in Rust process memory. There is no IPC command to inspect, export, or retrieve the database key.
+2. **Command-Level Role Authorization:** When `query_offline_cache` is called, the Rust native command handler does not simply execute the query; it inspects the DPAPI-sealed session snapshot. If the active session lacks authority for the requested module (e.g., student attempting to query financial ledgers), Rust rejects the IPC call with an `AccessDenied` error.
+3. **Data Minimization:** Query results returned across IPC contain only sanitized, non-sensitive operational fields. Highly sensitive fields (national IDs, bank details) are never cached or returned across IPC.
+4. **Backend Token Reuse Limitation:** An empirical audit of `AuthService.java:117` confirms that the **existing backend does NOT invalidate an entire refresh-token family upon reuse**. When an already-revoked refresh token is presented, the server throws `InvalidTokenException`, but does not revoke descendant tokens or invalidate active sessions for that user. Full token family revocation remains a required backend security fix (P1).
 
 ---
 
@@ -153,6 +160,6 @@ To maintain long-term architectural integrity, the development team must adhere 
 1. **Rule 1 (Zero Key Exposure):** Under no circumstances shall cryptographic keys (AES keys, DPAPI master keys, Minisign private keys) ever be passed into or out of the IPC channel.
 2. **Rule 2 (No Unrestricted Filesystem Access):** All file reads and writes must be handled within Rust native services targeting explicitly sandboxed application paths (`%APPDATA%`, `%LOCALAPPDATA%`).
 3. **Rule 3 (No Arbitrary Shell Execution):** The application shall not enable or bundle `shell:execute` or `shell:open` capabilities for arbitrary command lines.
-4. **Rule 4 (Minimal Command Surface):** Every newly proposed Tauri command must undergo an architecture security review. If an operation can be performed within standard web browser semantics, it must not be added to Rust.
+4. **Rule 4 (Command-Level Native Authorization):** Native Rust command handlers must independently verify caller session state and permissions before returning sensitive records.
 5. **Rule 5 (Input Bounds Enforcement):** All Rust IPC handlers must validate arguments independently of frontend assertions. Never trust client-supplied IDs, limits, or URLs.
-6. **Rule 6 (No Authorization Duplication):** Rust IPC handlers enforce local snapshot boundaries for offline queries, but never attempt to simulate or overwrite central Spring Boot business logic.
+6. **Rule 6 (Data Minimization):** IPC return payloads must contain only the minimum necessary fields required to render the view, preventing bulk data extraction via XSS.
